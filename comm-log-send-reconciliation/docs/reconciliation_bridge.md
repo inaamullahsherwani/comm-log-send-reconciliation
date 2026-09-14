@@ -1,0 +1,22 @@
+\## Reconciliation bridge: naive → target\_base
+
+
+
+| # | Step | What I checked | Result | Why it's wrong / what it fixes |
+
+|---|---|---|---|---|
+
+| 1 | \*\*Naive attempt A\*\* | `COUNT(\*)` over all `communication\_log` rows (merchant 501, Oct, type '2') | \*\*30\*\* | This is "every send attempt," including failed retries and an ineligible campaign — overcounts. |
+
+| 2 | \*\*Naive attempt B\*\* (sanity check) | `COUNT(DISTINCT customer\_id)` over the same rows, no filters | \*\*25\*\* | Tempting, but wrong in two directions at once: it wrongly collapses `9101`'s legitimate repeat customer (C20 should count twice, standalone), \*and\* it still includes the 4 customers from the ineligible campaign `9004`. Neither naive approach survives inspection. |
+
+| 3 | \*\*Adjustment 1: apply the eligibility gate\*\* | Join to `campaign`, keep only rows where `creation\_status` is finalized and `processing\_status = 'processed'`. Drops campaign `9004` (`approval\_awaiting`) — 4 rows (C11–C14). | 30 → \*\*26\*\* | These 4 rows are real sends in the log, but `9004` hasn't cleared approval — per the README, not reportable yet even though the pipeline already ran. |
+
+| 4 | \*\*Checkpoint: split the 26 rows by family structure\*\* | Traced every campaign's `parent\_id` chain (independent of eligibility) to find its root, then labeled each root's family `chain` (>1 campaign under it) or `standalone` (1). Broke the 26 eligible rows down by family: `9001` family → 13 rows, `9201` family → 6 rows, `9101` (standalone) → 7 rows. `13+6+7=26` ✓ ties back to step 3, confirming no rows were lost or double-counted in the split. | 13 / 6 / 7 | This checkpoint exists specifically to catch mistakes before collapsing — if these three numbers hadn't summed to 26, something would be wrong with the family-tagging logic. |
+
+| 5 | \*\*Adjustment 2: collapse chain families to distinct customers\*\* | Within each `chain` family, `COUNT(DISTINCT customer\_id)`: family `9001` (C1–C10, each reached once even though C2 and C3 needed 2–3 attempts): 13 rows → \*\*10\*\*. Family `9201` (D1–D5, D1 needed a retry): 6 rows → \*\*5\*\*. | 13→10 (−3), 6→5 (−1) | This is the actual "same underlying communication reached the same customer more than once" collapse the README describes — retries within a chain aren't separate events. |
+
+| 6 | \*\*No adjustment: standalone stays row-level\*\* | Campaign `9101` has no parent and no children, so per the README every send is its own event — C20's two sends both count, C21–C25 count once each. | \*\*7\*\* (unchanged) | Confirms the rule doesn't over-apply: this is the one place I deliberately did \*not\* collapse, because collapsing here would be the exact mistake naive attempt B made. |
+
+| 7 | \*\*Final: sum the pieces\*\* | `10` (family 9001) `+ 5` (family 9201) `+ 7` (standalone 9101) | \*\*= 22\*\* | Matches the SQL query's output exactly, and the two candidate paths (row-count math vs. the actual SQL) agree. |
+
